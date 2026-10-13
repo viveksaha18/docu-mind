@@ -1,17 +1,108 @@
-"""Gemini embeddings, FAISS retrieval, and context-grounded answers."""
+"""Embedding, retrieval, and grounded answer generation for Gemini or Ollama-backed models."""
 
+import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import faiss
 import numpy as np
 from google import genai
 from google.genai import types
 
-from backend.app.chunking import TextChunk
+from .chunking import TextChunk
 
 UNSUPPORTED_ANSWER = "I couldn't find an answer to that in the uploaded document."
 EMBEDDING_DIMENSIONS = 768
+
+
+class OllamaGateway:
+    """Use local Ollama embeddings and local or cloud answer generation."""
+
+    def __init__(self) -> None:
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        self.chat_base_url = os.getenv("OLLAMA_CHAT_BASE_URL", self.base_url).rstrip("/")
+        self.api_key = os.getenv("OLLAMA_API_KEY")
+        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        self.answer_model = os.getenv("OLLAMA_CHAT_MODEL", os.getenv("OLLAMA_MODEL", "gpt-oss"))
+
+    def _request_json(self, endpoint: str, payload: dict, base_url: str, authenticated: bool = False) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if authenticated and self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            f"{base_url}{endpoint}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Ollama request failed for {endpoint}: {error}") from error
+
+    def _chat_request(self, payload: dict) -> dict:
+        host = urlparse(self.chat_base_url).hostname
+        is_local = host in {"localhost", "127.0.0.1", "::1"}
+        if not is_local and not self.api_key:
+            raise RuntimeError("OLLAMA_API_KEY is required when using a remote Ollama endpoint.")
+        return self._request_json(
+            "/api/chat", payload, self.chat_base_url, authenticated=not is_local
+        )
+
+    def embed_documents(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+        response = self._request_json(
+            "/api/embed", {"model": self.embedding_model, "input": texts}, self.base_url
+        )
+        embeddings = response.get("embeddings")
+        if not embeddings:
+            raise RuntimeError("Ollama did not return document embeddings.")
+        vectors = np.asarray(embeddings, dtype=np.float32)
+        if len(vectors) != len(texts):
+            raise RuntimeError("Ollama returned an unexpected number of document embeddings.")
+        return vectors
+
+    def embed_question(self, question: str) -> np.ndarray:
+        response = self._request_json(
+            "/api/embed", {"model": self.embedding_model, "input": question}, self.base_url
+        )
+        embeddings = response.get("embeddings")
+        if not embeddings:
+            raise RuntimeError("Ollama did not return a question embedding.")
+        return np.asarray(embeddings[0], dtype=np.float32)
+
+    def generate_answer(self, question: str, context: str) -> str:
+        prompt = f"""You answer questions using only the document excerpts below.
+If the excerpts do not contain enough evidence, reply exactly:
+{UNSUPPORTED_ANSWER}
+Do not use outside knowledge. Do not invent details. Cite supporting page numbers inline
+using the format (p. 3) or (pp. 3, 4). Keep the answer concise.
+
+Document excerpts:
+{context}
+
+Question: {question}
+Answer:"""
+        response = self._chat_request(
+            {
+                "model": self.answer_model,
+                "stream": False,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        answer = response.get("message", {}).get("content", "").strip()
+        return answer or UNSUPPORTED_ANSWER
+
+
+def get_default_gateway():
+    if os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_MODEL") or os.getenv("OLLAMA_EMBEDDING_MODEL"):
+        return OllamaGateway()
+    return GeminiGateway()
 
 
 class GeminiGateway:

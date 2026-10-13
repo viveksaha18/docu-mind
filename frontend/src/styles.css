@@ -120,6 +120,9 @@ button:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px sol
 .question-row p { margin: 4px 0 19px; color: #293c30; font-size: 13px; font-weight: 600; line-height: 1.55; }
 .answer-content { min-width: 0; padding-top: 3px; }
 .answer-content > p { margin: 0; color: #4e5b51; font-size: 13px; line-height: 1.75; white-space: pre-wrap; }
+.unsupported-answer { display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; border: 1px solid #f0d4b8; border-radius: 6px; background: #fffaf4; }
+.unsupported-answer-icon { display: grid; place-items: center; color: #b7693b; }
+.unsupported-answer p { margin: 0; color: #7a4a2f; font-size: 13px; line-height: 1.7; }
 .inline-citations { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .inline-citations button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid #dfe8d9; border-radius: 3px; color: #58714f; background: #f7faf5; font: 9px var(--mono); cursor: pointer; }
 .inline-citations button:hover { border-color: #a9c39e; background: #edf4e9; }

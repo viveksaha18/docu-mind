@@ -14,6 +14,11 @@ import {
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const UNSUPPORTED_ANSWER_TEXT = "I couldn't find an answer to that in the uploaded document.";
+
+function isUnsupportedAnswer(answer) {
+  return typeof answer === "string" && answer.trim() === UNSUPPORTED_ANSWER_TEXT;
+}
 
 async function readApiResponse(response) {
   const payload = await response.json().catch(() => ({}));
@@ -39,7 +44,9 @@ function App() {
   const [selectedSource, setSelectedSource] = useState(null);
   const fileInputRef = useRef(null);
   const conversationEndRef = useRef(null);
-  const latestSources = messages.at(-1)?.sources ?? [];
+  const latestMessage = messages.at(-1);
+  const latestSources = latestMessage?.sources ?? [];
+  const latestAnswerIsUnsupported = isUnsupportedAnswer(latestMessage?.answer ?? "");
 
   useEffect(() => {
     fetch(`${API_BASE_URL}/api/health`)
@@ -172,7 +179,7 @@ function App() {
       <div className="workspace" id="workspace">
         <header className="topbar">
           <div className="breadcrumb"><span>WORKSPACE</span><span className="crumb-divider">/</span><strong>PDF ASSISTANT</strong></div>
-          <div className="topbar-right"><span className="model-indicator"><Sparkles size={14} /> GEMINI RAG</span></div>
+          <div className="topbar-right"><span className="model-indicator"><Sparkles size={14} /> OLLAMA CLOUD</span></div>
         </header>
 
         <div className="workspace-grid">
@@ -244,8 +251,19 @@ function App() {
                           <div className="answer-row">
                             <span className="answer-avatar"><Sparkles size={15} /></span>
                             <div className="answer-content">
-                              {message.answer ? <p>{message.answer}</p> : <div className="thinking"><span /><span /><span /> Reading relevant passages</div>}
-                              {message.sources.length > 0 && (
+                              {message.answer ? (
+                                isUnsupportedAnswer(message.answer) ? (
+                                  <div className="unsupported-answer">
+                                    <div className="unsupported-answer-icon"><CircleAlert size={15} /></div>
+                                    <p>{message.answer}</p>
+                                  </div>
+                                ) : (
+                                  <p>{message.answer}</p>
+                                )
+                              ) : (
+                                <div className="thinking"><span /><span /><span /> Reading relevant passages</div>
+                              )}
+                              {message.sources.length > 0 && !isUnsupportedAnswer(message.answer) && (
                                 <div className="inline-citations">
                                   {message.sources.map((source, sourceIndex) => (
                                     <button key={`${source.page_numbers.join("-")}-${sourceIndex}`} onClick={() => setSelectedSource(source)}>
@@ -316,6 +334,8 @@ function App() {
                       </button>
                     ))}
                   </div>
+                ) : latestAnswerIsUnsupported ? (
+                  <p className="sources-empty">No matching passage was found in this document for that question.</p>
                 ) : (
                   <p className="sources-empty">Ask a question to see the passages used to form the answer.</p>
                 )}

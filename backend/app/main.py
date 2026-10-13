@@ -8,15 +8,18 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from google.genai.errors import ClientError
 from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
-from backend.app.chunking import chunk_pages
-from backend.app.pdf_processing import PDFProcessingError, extract_pdf_pages
-from backend.app.rag import (
+from .chunking import chunk_pages
+from .pdf_processing import PDFProcessingError, extract_pdf_pages
+from .rag import (
     UNSUPPORTED_ANSWER,
     DocumentIndex,
     GeminiGateway,
     answer_question,
+    get_default_gateway,
 )
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
@@ -25,6 +28,10 @@ logger = logging.getLogger(__name__)
 MAX_PDF_BYTES = 20 * 1024 * 1024
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
+GEMINI_QUOTA_MESSAGE = (
+    "The answer service is temporarily unavailable because the Gemini API quota has been reached. "
+    "Please try again later or check your API billing."
+)
 
 app = FastAPI(title="DocuMind API", version="1.0.0")
 app.add_middleware(
@@ -35,7 +42,7 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-gemini_gateway = GeminiGateway()
+gemini_gateway = get_default_gateway()
 document_indexes: dict[str, DocumentIndex] = {}
 
 
@@ -85,22 +92,34 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
         raise HTTPException(status_code=413, detail="PDF files must be 20 MB or smaller.")
 
     try:
-        pages = extract_pdf_pages(pdf_bytes)
+        pages = await run_in_threadpool(extract_pdf_pages, pdf_bytes)
     except PDFProcessingError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
-    chunks = chunk_pages(pages, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    chunks = await run_in_threadpool(
+        chunk_pages, pages, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP
+    )
     try:
-        index = DocumentIndex.from_chunks(chunks, gemini_gateway)
+        index = await run_in_threadpool(
+            DocumentIndex.from_chunks, chunks, gemini_gateway
+        )
+    except ClientError as error:
+        if getattr(error, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(error).upper():
+            raise HTTPException(
+                status_code=429,
+                detail="Gemini API quota has been reached. Please try again later or add billing.",
+            ) from error
+        logger.exception("Gemini embedding request failed")
+        raise HTTPException(status_code=502, detail="Gemini could not process this PDF.") from error
     except RuntimeError as error:
         logger.exception("Could not create embeddings for uploaded document")
         raise HTTPException(
             status_code=503,
-            detail="Could not create embeddings. Check the backend Gemini API key and availability.",
+            detail="Could not create embeddings. Check the configured embedding model and provider availability.",
         ) from error
     except Exception as error:
-        logger.exception("Gemini embedding request failed")
-        raise HTTPException(status_code=502, detail="Gemini could not process this PDF.") from error
+        logger.exception("Embedding provider could not process uploaded PDF")
+        raise HTTPException(status_code=502, detail="The embedding provider could not process this PDF.") from error
 
     document_id = uuid4().hex
     document_indexes[document_id] = index
@@ -120,15 +139,23 @@ def ask_question(document_id: str, request: QuestionRequest) -> AnswerResponse:
 
     try:
         answer, matches = answer_question(request.question, document_index, gemini_gateway)
-    except RuntimeError as error:
-        logger.exception("Gemini could not answer document question")
+    except ClientError as error:
+        if getattr(error, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(error).upper():
+            return AnswerResponse(answer=GEMINI_QUOTA_MESSAGE, sources=[])
+        logger.exception("Configured model provider could not answer document question")
         raise HTTPException(
             status_code=503,
-            detail="Gemini is unavailable. Check the backend API key and try again.",
+            detail="The configured model provider is unavailable. Check its URL, API key, and model name.",
+        ) from error
+    except RuntimeError as error:
+        logger.exception("Configured model provider could not answer document question")
+        raise HTTPException(
+            status_code=503,
+            detail="The configured model provider is unavailable. Check its URL, API key, and model name.",
         ) from error
     except Exception as error:
         logger.exception("Document question processing failed")
-        raise HTTPException(status_code=502, detail="Could not process the question.") from error
+        raise HTTPException(status_code=502, detail="Could not process the question. Check the backend logs for details.") from error
 
     if answer == UNSUPPORTED_ANSWER:
         return AnswerResponse(answer=answer, sources=[])

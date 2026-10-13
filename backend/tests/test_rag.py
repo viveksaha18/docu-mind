@@ -9,6 +9,7 @@ from backend.app.rag import (
     UNSUPPORTED_ANSWER,
     DocumentIndex,
     GeminiGateway,
+    OllamaGateway,
     answer_question,
 )
 
@@ -83,3 +84,53 @@ def test_generate_answer_keeps_client_alive_for_request(monkeypatch) -> None:
     monkeypatch.setattr("backend.app.rag.genai.Client", Client)
 
     assert GeminiGateway().generate_answer("Question?", "Context") == "Grounded answer."
+
+
+def test_ollama_cloud_chat_uses_bearer_key_without_sending_it_to_embeddings(monkeypatch) -> None:
+    requests = []
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return self.body
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        if request.full_url.endswith("/api/embed"):
+            return Response(b'{"embeddings":[[0.0,1.0]]}')
+        return Response(b'{"message":{"content":"Cloud answer."}}')
+
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("OLLAMA_CHAT_BASE_URL", "https://ollama.com")
+    monkeypatch.setenv("OLLAMA_API_KEY", "test-ollama-key")
+    monkeypatch.setenv("OLLAMA_MODEL", "gpt-oss:120b")
+    monkeypatch.setattr("backend.app.rag.urllib.request.urlopen", fake_urlopen)
+
+    gateway = OllamaGateway()
+    assert gateway.generate_answer("Question?", "Context") == "Cloud answer."
+    gateway.embed_question("Question?")
+
+    assert requests[0].full_url == "https://ollama.com/api/chat"
+    assert requests[0].get_header("Authorization") == "Bearer test-ollama-key"
+    assert requests[1].full_url == "http://localhost:11434/api/embed"
+    assert requests[1].get_header("Authorization") is None
+
+
+def test_ollama_cloud_requires_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_CHAT_BASE_URL", "https://ollama.com")
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+
+    try:
+        OllamaGateway().generate_answer("Question?", "Context")
+    except RuntimeError as error:
+        assert "OLLAMA_API_KEY is required" in str(error)
+    else:
+        raise AssertionError("Cloud requests without an API key must fail clearly.")
